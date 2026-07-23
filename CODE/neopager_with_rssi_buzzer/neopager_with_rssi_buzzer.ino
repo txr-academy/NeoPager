@@ -4,10 +4,14 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 
-// ===================== SETTINGS YOU CHANGE =====================
-#define DEVICE_ID  // Change to 2 on the second pager
+// =================================================================
+#define DEVICE_ID 1
 
-// ===================== BOARD PINS (do not change) =====================
+// =================================================================
+// BOARD PINS
+// These match how everything is wired on the Heltec board.
+// Don't touch unless you rewire something.
+// =================================================================
 #define LORA_NSS 8
 #define LORA_SCK 9
 #define LORA_MOSI 10
@@ -19,9 +23,12 @@
 #define OLED_SCL 18
 #define OLED_RST 21
 #define VEXT_CTRL 36
-#define BUZZER_PIN 42 // buzzer signal pin — GPIO 42 (SAFE PIN)
+#define BUZZER_PIN 46   // buzzer wire goes here
 
-// ===================== RADIO SETTINGS =====================
+// =================================================================
+// RADIO (LoRa) SETTINGS
+// Both pagers must use the SAME settings here or they won't talk.
+// =================================================================
 #define LORA_FREQ 866.0 // frequency allowed for LoRa use in India
 #define LORA_BW 125.0   // bandwidth
 #define LORA_SF 10      // spreading factor (range vs speed tradeoff)
@@ -29,7 +36,11 @@
 #define LORA_SYNC 0x12  // sync word, like a "channel code" between the 2 pagers
 #define LORA_PWR 22     // transmit power
 
-// ===================== KEYPAD SETUP =====================
+// =================================================================
+// KEYPAD LAYOUT
+// This is just a map of which key is which on the 4x4 keypad,
+// and which physical pins the rows/columns are wired to.
+// =================================================================
 const byte ROWS = 4, COLS = 4;
 char keyMap[ROWS][COLS] = {{'1', '2', '3', 'A'},
                            {'4', '5', '6', 'B'},
@@ -39,14 +50,21 @@ byte rowPins[ROWS] = {38, 1, 2, 3};
 byte colPins[COLS] = {4, 5, 6, 7};
 Keypad keypad = Keypad(makeKeymap(keyMap), rowPins, colPins, ROWS, COLS);
 
-// ===================== QUICK MESSAGES (A/B/C/D) =====================
+// =================================================================
+// QUICK MESSAGES
+// Press A, B, C or D and it sends this exact message instantly.
+// Change the text here if you want different quick messages.
+// =================================================================
 const char *MSG_A = "I need help, please come now";
 const char *MSG_B = "I am at the meeting";
 const char *MSG_C = "Where are you?";
 const char *MSG_D = "Task done, acknowledged";
 
-// ===================== FILL-IN-THE-BLANK MESSAGES (1/2/3)
-// =====================
+// =================================================================
+// FILL-IN-THE-BLANK MESSAGES
+// Press 1, 2 or 3, then type a number, then press # to send.
+// Example: press 1, type 5, press # -> sends "Will be back in 5 min"
+// =================================================================
 const char *TMPL_1_PRE = "Will be back in ";
 const char *TMPL_1_SUF = " min";
 const char *TMPL_2_PRE = "Meet me at floor ";
@@ -54,62 +72,74 @@ const char *TMPL_2_SUF = "";
 const char *TMPL_3_PRE = "Call me in ";
 const char *TMPL_3_SUF = " min";
 
-// ===================== MESSAGE HISTORY =====================
+// =================================================================
+// MESSAGE HISTORY (last 15 messages, saved to flash so they survive reboot)
+// =================================================================
 #define HISTORY_SIZE 15
-String msgHistory[HISTORY_SIZE];
-String msgSender[HISTORY_SIZE];
+String msgHistory[HISTORY_SIZE];   // the actual message text
+String msgSender[HISTORY_SIZE];    // who sent it (device ID)
 
-// ===================== MAIN OBJECTS =====================
+// =================================================================
+// MAIN OBJECTS - radio, screen, flash storage
+// =================================================================
 SPIClass loraSPI(FSPI);
 SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY, loraSPI);
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, OLED_RST, OLED_SCL, OLED_SDA);
 Preferences prefs;
 
-// ===================== STATE FLAGS =====================
-volatile bool radioFlag = false;
-bool templateMode = false;
-bool historyMode = false;
-bool alertMode = false;
-char activeTemplate = 0;
-String typedNumber = "";
-int historySelected = 0;
-int historyTop = 0;
+// =================================================================
+// STATE FLAGS - these track "what screen/mode are we in right now"
+// =================================================================
+volatile bool radioFlag = false;   // true = a LoRa packet just arrived
+bool templateMode = false;         // true = user is typing a fill-in-blank message
+bool historyMode = false;          // true = user is browsing old messages
+bool alertMode = false;            // true = showing a just-received message
+char activeTemplate = 0;           // which template (1/2/3) is being filled
+String typedNumber = "";           // number the user is typing in template mode
+int historySelected = 0;           // which history row is highlighted
+int historyTop = 0;                // which history row is at top of screen
 
-// ===================== ACK / DELIVERY TRACKING =====================
-uint16_t nextMsgId = 1;
-bool ackPending = false;
+// =================================================================
+// ACK / DELIVERY TRACKING
+// When we send a message we wait for the other pager to confirm
+// it got it (ACK). If no ACK comes in time, we resend.
+// =================================================================
+uint16_t nextMsgId = 1;            // each message gets its own ID number
+bool ackPending = false;           // true = waiting for confirmation
 uint16_t pendingMsgId = 0;
-String pendingWireMsg = "";
-String pendingDisplayMsg = "";
+String pendingWireMsg = "";        // exact message being sent over radio
+String pendingDisplayMsg = "";     // the readable version for the screen
 unsigned long pendingSentTime = 0;
 int pendingRetries = 0;
-const unsigned long ACK_TIMEOUT_MS = 10000; // wait 10 sec before resending
-const int MAX_RETRIES = 2;                 // give up after 2 resends
+const unsigned long ACK_TIMEOUT_MS = 6000;   // wait 6 sec before resending
+const int MAX_RETRIES = 2;                    // give up after 2 resends
 
+// last message we received, kept handy for the alert screen
 String lastRxMessage = "";
 String lastRxSender = "";
 uint16_t lastRxMsgId = 0;
-float lastRxRssi = 0.0;
 
-// ── ISR: fires the moment a radio packet arrives ──
+// this runs the instant a LoRa packet lands (interrupt), just sets a flag
 void IRAM_ATTR onRadio() { radioFlag = true; }
 
-// ===================== BUZZER =====================
-// Manual PWM loop to avoid ESP32 timer conflicts with radio/display
+// =================================================================
+// BUZZER
+// Buzzer is active-LOW, meaning LOW = beep, HIGH = quiet.
+// =================================================================
 void beep() {
-  // 500 cycles of 400us = ~200ms at 2500Hz
-  for (int i = 0; i < 500; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(BUZZER_PIN, LOW);
-    delayMicroseconds(390);
-  }
+  digitalWrite(BUZZER_PIN, LOW);    // buzzer ON
+  delay(200);
+  digitalWrite(BUZZER_PIN, HIGH);   // buzzer OFF
 }
 
-// ===================== HISTORY: FLASH STORAGE =====================
+// =================================================================
+// SAVING / LOADING HISTORY TO FLASH MEMORY
+// So old messages are still there after a power cut or reset.
+// =================================================================
 void saveHistoryToFlash() {
   for (int i = 0; i < HISTORY_SIZE; i++) {
     String key = "h" + String(i);
+    // store as "sender|message" in one string
     prefs.putString(key.c_str(), msgSender[i] + "|" + msgHistory[i]);
   }
 }
@@ -129,6 +159,7 @@ void loadHistoryFromFlash() {
   }
 }
 
+// adds a new message at the top of the list, pushes everything else down
 void addToHistory(const String &sender, const String &message) {
   for (int i = HISTORY_SIZE - 1; i > 0; i--) {
     msgHistory[i] = msgHistory[i - 1];
@@ -139,26 +170,35 @@ void addToHistory(const String &sender, const String &message) {
   saveHistoryToFlash();
 }
 
-// ===================== HELPERS =====================
+// =================================================================
+// SMALL HELPERS
+// =================================================================
+
+// cuts a long string short and adds "..." at the end, so it fits on screen
 String truncate(const String &s, int maxChars) {
   if ((int)s.length() <= maxChars)
     return s;
   return s.substring(0, maxChars - 3) + "...";
 }
 
+// puts the radio back into "listening" mode so it can receive packets
 void startListening() {
   radioFlag = false;
   radio.startReceive();
 }
 
-// ===================== DISPLAY FUNCTIONS =====================
+// =================================================================
+// SCREEN FUNCTIONS
+// =================================================================
+
+// draws a simple 4-line status screen (title bar + up to 3 lines of text)
 void showStatus(const char *l1, const char *l2 = "", const char *l3 = "",
                 const char *l4 = "") {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   String hdr = "Pager " + String(DEVICE_ID) + "  866MHz";
   u8g2.drawStr(0, 9, hdr.c_str());
-  u8g2.drawHLine(0, 11, 128);
+  u8g2.drawHLine(0, 11, 128);   // line under the header
   u8g2.setFont(u8g2_font_9x18_tf);
   u8g2.drawStr(0, 28, l1);
   u8g2.setFont(u8g2_font_7x13_tf);
@@ -169,13 +209,16 @@ void showStatus(const char *l1, const char *l2 = "", const char *l3 = "",
     u8g2.drawStr(0, 55, l3);
   if (strlen(l4))
     u8g2.drawStr(0, 64, l4);
-  u8g2.drawFrame(0, 0, 128, 64);
+  u8g2.drawFrame(0, 0, 128, 64);   // border around the whole screen
   u8g2.sendBuffer();
 }
 
+// shows the normal "waiting for input" home screen
 void showReady() { showStatus("Ready", "0 = history"); }
 
-// Scrolls message sideways if too long; checks for ACK every frame
+// Shows a message big on screen. If it's too long to fit, it scrolls
+// sideways like a news ticker. Also keeps checking if an ACK is needed
+// while it scrolls, so nothing gets stuck waiting.
 void scrollBigMessage(const char *header, const char *message, int repeatCount,
                       const char *footer = "") {
   u8g2.setFont(u8g2_font_10x20_tf);
@@ -184,6 +227,7 @@ void scrollBigMessage(const char *header, const char *message, int repeatCount,
 
   for (int rep = 0; rep < repeatCount; rep++) {
     if (textWidth <= screenW) {
+      // message fits fully on screen, no need to scroll
       u8g2.clearBuffer();
       u8g2.setFont(u8g2_font_6x10_tf);
       u8g2.drawStr(0, 9, header);
@@ -198,11 +242,12 @@ void scrollBigMessage(const char *header, const char *message, int repeatCount,
       u8g2.sendBuffer();
       unsigned long t = millis();
       while (millis() - t < 2000) {
-        if (radioFlag)
+        if (radioFlag)   // new packet came in, stop and handle it
           return;
         delay(20);
       }
     } else {
+      // message is too long, scroll it right to left
       for (int x = screenW; x > -textWidth; x -= 3) {
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_6x10_tf);
@@ -225,7 +270,13 @@ void scrollBigMessage(const char *header, const char *message, int repeatCount,
   }
 }
 
-// ===================== HISTORY SCREEN =====================
+// =================================================================
+// HISTORY SCREEN
+// Lets you scroll up/down through old messages with keys 4 and 7,
+// press # to view one fully, press * to go back.
+// =================================================================
+
+// draws the 3 visible rows of the history list, highlighting the selected one
 void drawHistoryFrame(int scrollX) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
@@ -248,6 +299,7 @@ void drawHistoryFrame(int scrollX) {
             : String(i + 1) + ". P" + msgSender[i] + ":" + msgHistory[i];
 
     if (i == historySelected) {
+      // draw this row inverted (highlighted) since it's selected
       u8g2.setDrawColor(1);
       u8g2.drawBox(0, yPos[row] - rowHeight, 128, rowHeight + 2);
       u8g2.setDrawColor(0);
@@ -263,6 +315,7 @@ void drawHistoryFrame(int scrollX) {
   u8g2.sendBuffer();
 }
 
+// keeps the selected row visible inside the 3-row window
 void adjustHistoryWindow() {
   if (historySelected < historyTop)
     historyTop = historySelected;
@@ -270,6 +323,7 @@ void adjustHistoryWindow() {
     historyTop = historySelected - 2;
 }
 
+// main loop for the history screen - waits for keys, redraws as needed
 void showHistoryScreen() {
   adjustHistoryWindow();
 
@@ -283,21 +337,21 @@ void showHistoryScreen() {
   int textWidth = u8g2.getStrWidth(selLine.c_str());
   int screenW = 128;
 
-  // Static display if text fits
+  // if the selected line fits fully, no need to scroll it
   if (textWidth <= screenW) {
     drawHistoryFrame(1);
     while (true) {
       char k = keypad.getKey();
       if (k) {
-        if (k == '4') {
+        if (k == '4') {              // move selection up
           historySelected = max(0, historySelected - 1);
           showHistoryScreen();
           return;
-        } else if (k == '7') {
+        } else if (k == '7') {       // move selection down
           historySelected = min(HISTORY_SIZE - 1, historySelected + 1);
           showHistoryScreen();
           return;
-        } else if (k == '#') {
+        } else if (k == '#') {       // view full message
           if (msgHistory[historySelected].length() > 0) {
             String hdr = "FROM " + msgSender[historySelected];
             scrollBigMessage(hdr.c_str(), msgHistory[historySelected].c_str(),
@@ -305,13 +359,13 @@ void showHistoryScreen() {
             showHistoryScreen();
           }
           return;
-        } else if (k == '*') {
+        } else if (k == '*') {       // back to home screen
           historyMode = false;
           showReady();
           return;
         }
       }
-      if (radioFlag) {
+      if (radioFlag) {   // new message arrived while browsing history
         historyMode = false;
         return;
       }
@@ -320,7 +374,7 @@ void showHistoryScreen() {
     }
   }
 
-  // Scroll selected line if too long
+  // selected line is too long, scroll it sideways while still checking keys
   int x = screenW;
   while (true) {
     drawHistoryFrame(x);
@@ -360,7 +414,11 @@ void showHistoryScreen() {
   }
 }
 
-// ===================== RADIO TX =====================
+// =================================================================
+// SENDING MESSAGES OVER LORA
+// =================================================================
+
+// actually sends the message over radio and shows "Sending..." etc on screen
 void transmitMessage(const String &wireMsg, const String &displayMsg) {
   radio.standby();
   u8g2.clearBuffer();
@@ -373,10 +431,10 @@ void transmitMessage(const String &wireMsg, const String &displayMsg) {
   Serial.println(wireMsg);
   String txMsg = wireMsg;
   int state = radio.transmit(txMsg);
-  startListening();
+  startListening();   // go back to listening right after sending
 
   if (state == RADIOLIB_ERR_NONE) {
-    String txHdr = "SENT Msg#" + String(pendingMsgId);
+  String txHdr = "SENT M#" + String(pendingMsgId);
     scrollBigMessage(txHdr.c_str(), displayMsg.c_str(), 1);
     showStatus("Waiting...", "for delivery ACK");
   } else {
@@ -386,11 +444,13 @@ void transmitMessage(const String &wireMsg, const String &displayMsg) {
   }
 }
 
+// wraps a message with an ID number and starts tracking it for an ACK
 void sendTrackedMessage(const String &payload) {
   uint16_t msgId = nextMsgId++;
-  if (nextMsgId > 9999)
+  if (nextMsgId > 9999)   // wrap back around so the ID never overflows
     nextMsgId = 1;
 
+  // wire format: MSG|senderID|msgID|actual text
   String wire =
       "MSG|" + String(DEVICE_ID) + "|" + String(msgId) + "|" + payload;
 
@@ -404,6 +464,7 @@ void sendTrackedMessage(const String &payload) {
   transmitMessage(wire, payload);
 }
 
+// sends back a small "got it" packet to whoever sent us a message
 void sendAck(const String &toSender, uint16_t msgId) {
   radio.standby();
   String tx = "ACK|" + String(DEVICE_ID) + "|" + String(msgId) + "|";
@@ -412,11 +473,12 @@ void sendAck(const String &toSender, uint16_t msgId) {
   radio.transmit(tx);
 }
 
+// checks if we've been waiting too long for an ACK, and resends if so
 void checkAckTimeout() {
   if (!ackPending)
     return;
   if (millis() - pendingSentTime < ACK_TIMEOUT_MS)
-    return;
+    return;   // still within the wait time, do nothing yet
 
   if (pendingRetries < MAX_RETRIES) {
     pendingRetries++;
@@ -425,15 +487,20 @@ void checkAckTimeout() {
     String resend = pendingWireMsg;
     radio.transmit(resend);
     startListening();
-    pendingSentTime = millis();
+    pendingSentTime = millis();   // reset the clock for this retry
   } else {
+    // tried enough times, give up and tell the user
     ackPending = false;
     showStatus("No response", "Message may not", "have reached",
                "the other pager");
   }
 }
 
-// ===================== KEY HANDLERS =====================
+// =================================================================
+// KEY HANDLING
+// =================================================================
+
+// handles the instant quick-message keys: A, B, C, D
 void handleInstant(char key) {
   String msg;
   switch (key) {
@@ -455,6 +522,8 @@ void handleInstant(char key) {
   sendTrackedMessage(msg);
 }
 
+// puts together the final text for a fill-in-blank template, e.g.
+// template '1' + "5" -> "Will be back in 5 min"
 String buildTemplate(char tmpl, const String &num) {
   String pre, suf;
   switch (tmpl) {
@@ -476,6 +545,7 @@ String buildTemplate(char tmpl, const String &num) {
   return pre + (num.length() ? num : "__") + suf;
 }
 
+// draws the screen you see while typing a number into a template
 void showTemplateScreen() {
   String pre, suf;
   switch (activeTemplate) {
@@ -511,6 +581,7 @@ void showTemplateScreen() {
   u8g2.sendBuffer();
 }
 
+// starts template mode when user presses 1, 2 or 3
 void enterTemplateMode(char key) {
   templateMode = true;
   activeTemplate = key;
@@ -518,11 +589,14 @@ void enterTemplateMode(char key) {
   showTemplateScreen();
 }
 
-// ===================== ALERT LOOP =====================
-// Scrolls incoming message continuously until a key is pressed
+// =================================================================
+// ALERT SCREEN
+// This is what shows up right when a new message comes in.
+// It keeps scrolling the message until any key is pressed.
+// =================================================================
 void runAlertLoop() {
   alertMode = true;
-  String hdr = "P" + lastRxSender + " Msg#" + String(lastRxMsgId) + " " + String(lastRxRssi, 0) + "dBm";
+ String hdr = "P" + lastRxSender + " M#" + String(lastRxMsgId) + " " + String((int)radio.getRSSI()) + "dB";
   const char *msg = lastRxMessage.c_str();
 
   u8g2.setFont(u8g2_font_10x20_tf);
@@ -544,7 +618,7 @@ void runAlertLoop() {
 
     x -= 3;
     if (x < -textWidth)
-      x = screenW;
+      x = screenW;   // loop the scroll back to the start
 
     char k = keypad.getKey();
     if (k) {
@@ -554,12 +628,12 @@ void runAlertLoop() {
       case 'B':
       case 'C':
       case 'D':
-        handleInstant(k);
+        handleInstant(k);   // quick-reply with an instant message
         return;
       case '1':
       case '2':
       case '3':
-        enterTemplateMode(k);
+        enterTemplateMode(k);   // quick-reply with a fill-in-blank message
         templateMode = true;
         return;
       default:
@@ -568,7 +642,7 @@ void runAlertLoop() {
       }
     }
 
-    if (radioFlag) {
+    if (radioFlag) {   // another message came in already
       alertMode = false;
       return;
     }
@@ -577,7 +651,9 @@ void runAlertLoop() {
   }
 }
 
-// ===================== INCOMING PACKET HANDLER =====================
+// =================================================================
+// WHAT TO DO WHEN A PACKET ARRIVES
+// =================================================================
 void handleIncoming() {
   String raw;
   int state = radio.readData(raw);
@@ -592,7 +668,7 @@ void handleIncoming() {
   Serial.print("RX: ");
   Serial.println(raw);
 
-  // Packet format: TYPE|SenderID|MsgID|Payload
+  // packet format is: TYPE|senderID|msgID|payload
   int p1 = raw.indexOf('|');
   int p2 = raw.indexOf('|', p1 + 1);
   int p3 = raw.indexOf('|', p2 + 1);
@@ -608,7 +684,7 @@ void handleIncoming() {
   uint16_t msgId = raw.substring(p2 + 1, p3).toInt();
   String payload = raw.substring(p3 + 1);
 
-  // ── Delivery confirmation (ACK) ──
+  // ---- case 1: this is a delivery confirmation (ACK) ----
   if (type == "ACK") {
     if (ackPending && msgId == pendingMsgId) {
       ackPending = false;
@@ -616,7 +692,7 @@ void handleIncoming() {
       String l2 = "Msg #" + String(msgId);
       String l3 = "To Pager " + sender;
       showStatus("Delivered", l2.c_str(), l3.c_str());
-      while (!keypad.getKey()) {
+      while (!keypad.getKey()) {   // wait for any key before going back
         if (radioFlag)
           break;
         delay(30);
@@ -627,22 +703,21 @@ void handleIncoming() {
     return;
   }
 
-  // ── New message (MSG) ──
+  // ---- case 2: this is a new message (MSG) ----
   if (type == "MSG") {
-    // Send ACK immediately — sender waits max 6 s
+    // send the ACK straight away, sender only waits 6 sec max
     sendAck(sender, msgId);
     delay(50);
     startListening();
 
-    beep(); // one short beep — ACK already sent so timing is safe
+    beep();   // one short beep - safe to do this after the ACK is sent
 
     addToHistory(sender, payload);
     lastRxMessage = payload;
     lastRxSender = sender;
     lastRxMsgId = msgId;
-    lastRxRssi = radio.getRSSI();
 
-    String hdr = "P" + sender + " Msg#" + String(msgId) + " " + String(lastRxRssi, 0) + "dBm";
+  String hdr = "P" + sender + " M#" + String(msgId) + " " + String((int)radio.getRSSI()) + "dB";
     String ftr = "Msg #" + String(msgId);
     scrollBigMessage(hdr.c_str(), payload.c_str(), 2, ftr.c_str());
 
@@ -657,24 +732,22 @@ void handleIncoming() {
   startListening();
 }
 
-// ===================== SETUP =====================
+// =================================================================
+// SETUP - runs once when the pager powers on
+// =================================================================
 void setup() {
   Serial.begin(115200);
 
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(BUZZER_PIN, HIGH);   // buzzer OFF at boot
 
-  // ── BOOT TEST BEEP ──
-  for (int i = 0; i < 1000; i++) {   // ~400ms boot beep
-    digitalWrite(BUZZER_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(BUZZER_PIN, LOW);
-    delayMicroseconds(390);
-  }
-  delay(100);
+  // one beep on boot, just to confirm the buzzer works
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(400);
+  digitalWrite(BUZZER_PIN, HIGH);
 
   prefs.begin("neopager", false);
-  loadHistoryFromFlash();
+  loadHistoryFromFlash();   // bring back old messages from flash
 
   pinMode(VEXT_CTRL, OUTPUT);
   digitalWrite(VEXT_CTRL, LOW);
@@ -687,12 +760,13 @@ void setup() {
   int state =
       radio.begin(LORA_FREQ, LORA_BW, LORA_SF, LORA_CR, LORA_SYNC, LORA_PWR);
   if (state != RADIOLIB_ERR_NONE) {
+    // radio didn't start, no point continuing, just show error forever
     showStatus("Radio FAILED", ("Err:" + String(state)).c_str());
     while (true)
       delay(1000);
   }
 
-  radio.setDio1Action(onRadio);
+  radio.setDio1Action(onRadio);   // call onRadio() whenever a packet lands
   startListening();
 
   showStatus("Radio OK!", ("Pager " + String(DEVICE_ID)).c_str());
@@ -700,10 +774,13 @@ void setup() {
   showReady();
 }
 
-// ===================== MAIN LOOP =====================
+// =================================================================
+// MAIN LOOP - runs over and over, forever
+// =================================================================
 void loop() {
-  checkAckTimeout();
+  checkAckTimeout();   // always keep an eye on pending ACKs
 
+  // if a new packet arrived and we're not busy in a menu, handle it now
   if (radioFlag && !templateMode && !historyMode) {
     radioFlag = false;
     handleIncoming();
@@ -712,7 +789,7 @@ void loop() {
 
   char key = keypad.getKey();
   if (!key)
-    return;
+    return;   // no key pressed, nothing to do this round
   Serial.print("Key: ");
   Serial.println(key);
 
@@ -723,15 +800,15 @@ void loop() {
 
   if (templateMode) {
     if (key >= '0' && key <= '9') {
-      if (typedNumber.length() < 3) {
+      if (typedNumber.length() < 3) {   // limit to 3 digits
         typedNumber += key;
         showTemplateScreen();
       }
-    } else if (key == '*') {
+    } else if (key == '*') {   // cancel
       templateMode = false;
       typedNumber = "";
       showReady();
-    } else if (key == '#') {
+    } else if (key == '#') {   // confirm and send
       if (typedNumber.length() == 0) {
         showStatus("Enter a number", "then press #");
         delay(1500);
@@ -746,17 +823,18 @@ void loop() {
     return;
   }
 
+  // normal key presses from the home screen
   switch (key) {
   case 'A':
   case 'B':
   case 'C':
   case 'D':
-    handleInstant(key);
+    handleInstant(key);   // send a quick message
     break;
   case '1':
   case '2':
   case '3':
-    enterTemplateMode(key);
+    enterTemplateMode(key);   // start typing a fill-in-blank message
     break;
   case '0':
     historyMode = true;
