@@ -6,6 +6,7 @@
 #include "ui_inbox.h"
 #include "ui_keyboard.h"
 #include "ui_common.h"
+#include "ui_notify.h"
 #include <Arduino.h>
 #include <string.h>
 
@@ -17,7 +18,11 @@ static lv_obj_t* chat_scroll_cont = NULL;
 static lv_obj_t* input_bar_cont = NULL;
 static lv_obj_t* ta_input = NULL;
 static lv_obj_t* char_count_lbl = NULL;
-static lv_obj_t* chat_in_time_lbl = NULL;    /* time label of the incoming card (refreshed on cache hit) */
+static lv_obj_t* empty_lbl = NULL;           /* "No messages yet" hint, removed when the first bubble appears */
+static lv_obj_t* btn_poll = NULL;            /* Class A only: asks the modem for a poll uplink */
+static lv_obj_t* link_dot = NULL;            /* modem / network state: grey, green, amber, red */
+static int  last_link_level = -1;
+static bool last_poll_supported = true;
 
 /* Rebuild cache: the bubbles are rebuilt only when the thread changed or something
    arrived while the chat was hidden. */
@@ -52,11 +57,34 @@ static void lora_refresh_header(void) {
 
 static const char* tx_status_text(const LoraEntry& e) {
     switch (e.kind) {
-        case LORA_TX_SENDING: return "Sending...";
-        case LORA_TX_SENT:    return "Sent via LoRa";
-        case LORA_TX_FAILED:  return "Send failed";
-        default:              return e.info;
+        case LORA_TX_SENDING:   return "Sending...";
+        case LORA_TX_QUEUED:    return "Queued";
+        case LORA_TX_SENT:      return "Sent via LoRa";
+        case LORA_TX_DELIVERED: return "Delivered";
+        case LORA_TX_FAILED:    return "Send failed - tap to retry";
+        default:                return e.info;
     }
+}
+
+/* Link dot colour + poll button visibility follow the modem (cheap: only touches LVGL when something changed) */
+static void link_ui_update(void) {
+    if (!link_dot) return;
+    int lvl = lora_link_level();
+    if (lvl != last_link_level) {
+        last_link_level = lvl;
+        uint32_t col = (lvl == 1) ? 0x2E7D32 : (lvl == 2) ? 0xE28B00 : (lvl == 3) ? 0xB3261E : 0x9AA0A6;
+        lv_obj_set_style_bg_color(link_dot, lv_color_hex(col), 0);
+    }
+    bool ps = lora_poll_supported();
+    if (ps != last_poll_supported) {
+        last_poll_supported = ps;
+        if (ps) lv_obj_clear_flag(btn_poll, LV_OBJ_FLAG_HIDDEN);
+        else    lv_obj_add_flag(btn_poll, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void clear_empty(void) {
+    if (empty_lbl) { lv_obj_del(empty_lbl); empty_lbl = NULL; }
 }
 
 static void scroll_bottom(void) {
@@ -65,6 +93,7 @@ static void scroll_bottom(void) {
 
 /* Received-message bubble (left side, same look as the incoming card) */
 static void make_rx_bubble(const char* text, const char* info) {
+    clear_empty();
     lv_obj_t* bubble = lv_obj_create(chat_scroll_cont);
     lv_obj_set_width(bubble, 340);
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
@@ -88,8 +117,18 @@ static void make_rx_bubble(const char* text, const char* info) {
     lv_obj_set_style_text_color(msg_lbl, lv_color_hex(0x1F1F1F), 0);
 }
 
+/* Tap on a failed bubble = retry the same message (the bubble goes back to "Sending...") */
+static void on_tx_bubble_clicked(lv_event_t* ev) {
+    lv_indev_t* indev = lv_indev_get_act();
+    if (indev && lv_indev_get_scroll_obj(indev) != NULL) return;        /* it was a scroll, not a tap */
+    uint32_t seq = (uint32_t)(uintptr_t)lv_event_get_user_data(ev);
+    LoraEntry* e = lora_find_seq(seq);
+    if (e && e->kind == LORA_TX_FAILED) lora_resend(e);                 /* result_rev bump refreshes the label in chat_poll() */
+}
+
 /* Sent bubble (right side). Does not scroll: callers scroll once after a batch. */
-static void make_tx_bubble(const char* text, const char* timestamp) {
+static void make_tx_bubble(const char* text, const char* timestamp, uint32_t seq) {
+    clear_empty();
     lv_obj_t* row_wrap = lv_obj_create(chat_scroll_cont);
     lv_obj_set_size(row_wrap, LCD_HOR_RES - 32, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(row_wrap, LV_OPA_TRANSP, 0);
@@ -105,6 +144,8 @@ static void make_tx_bubble(const char* text, const char* timestamp) {
     lv_obj_set_style_radius(bubble, 16, 0);
     lv_obj_set_style_pad_all(bubble, 10, 0);
     lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bubble, on_tx_bubble_clicked, LV_EVENT_CLICKED, (void*)(uintptr_t)seq);
 
     lv_obj_t* time_lbl = lv_label_create(bubble);
     lv_label_set_text(time_lbl, timestamp);
@@ -142,36 +183,31 @@ static void sync_tx_labels(void) {             /* TX status changed: update ever
 }
 
 static void render_content(int idx) {
-    lv_obj_t* in_card = lv_obj_create(chat_scroll_cont);
-    lv_obj_set_width(in_card, LCD_HOR_RES - 32);
-    lv_obj_set_style_bg_color(in_card, lv_color_hex(0xF0F4F9), 0);
-    lv_obj_set_style_border_color(in_card, lv_color_hex(0xE0E2EC), 0);
-    lv_obj_set_style_border_width(in_card, 1, 0);
-    lv_obj_set_style_radius(in_card, 16, 0);
-    lv_obj_set_style_pad_all(in_card, 12, 0);
-    lv_obj_clear_flag(in_card, LV_OBJ_FLAG_SCROLLABLE);
-
-    chat_in_time_lbl = lv_label_create(in_card);
-    lv_label_set_text(chat_in_time_lbl, messages[idx].time);
-    lv_obj_set_pos(chat_in_time_lbl, 0, 0);
-    lv_obj_set_style_text_color(chat_in_time_lbl, lv_color_hex(0x5F6368), 0);
-
-    lv_obj_t* in_body = lv_label_create(in_card);
-    lv_label_set_text(in_body, messages[idx].full_body);
-    lv_obj_set_width(in_body, LCD_HOR_RES - 56);
-    lv_label_set_long_mode(in_body, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(in_body, 0, 24);
-    lv_obj_set_style_text_color(in_body, lv_color_hex(0x1F1F1F), 0);
-    lv_obj_set_style_text_line_space(in_body, 4, 0);
-
+    /* No intro card any more: the screen space goes to the conversation. */
+    empty_lbl = NULL;                                  /* chat_open() cleaned the container */
+    bool any = false;
     int n = lora_hist_count();
+    for (int i = 0; i < n; i++) if (lora_hist_at(i)->thread == idx) { any = true; break; }
+    if (!any) {
+        char hint[96];
+        const char* tag = app_tag(idx);
+        if (tag[0]) snprintf(hint, sizeof(hint), "No messages yet.\nMessages to this contact are sent to ID %s.", tag);
+        else        snprintf(hint, sizeof(hint), "No messages yet.\nMessages here are sent without an ID.");
+        empty_lbl = lv_label_create(chat_scroll_cont);
+        lv_label_set_text(empty_lbl, hint);
+        lv_obj_set_width(empty_lbl, LCD_HOR_RES - 40);
+        lv_label_set_long_mode(empty_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(empty_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty_lbl, lv_color_hex(0x747775), 0);
+    }
+
     for (int i = 0; i < n; i++) {
         LoraEntry* e = lora_hist_at(i);
         if (e->thread != idx) continue;               // only this chat's messages
         if (e->kind == LORA_RX_MSG) {
             make_rx_bubble(e->text, e->info);
         } else {
-            make_tx_bubble(e->text, tx_status_text(*e));
+            make_tx_bubble(e->text, tx_status_text(*e), e->seq);
             e->lbl = grab_last_bubble_label();
         }
     }
@@ -212,7 +248,7 @@ static void handle_send_message(void) {
     snprintf(messages[idx].preview, sizeof(messages[idx].preview), "You: %s", messages[idx].reply);
     inbox_refresh_row(idx);
 
-    make_tx_bubble(messages[idx].reply, e ? tx_status_text(*e) : "Just now");
+    make_tx_bubble(messages[idx].reply, e ? tx_status_text(*e) : "Just now", e ? e->seq : 0);
     if (e) e->lbl = grab_last_bubble_label();
     scroll_bottom();
 
@@ -301,6 +337,7 @@ void chat_open(int idx) {
 
     if (chat_dirty || thread_changed) {
         forget_labels();                            /* bubbles are about to be deleted */
+        empty_lbl = NULL;
         lv_obj_clean(chat_scroll_cont);
         render_content(idx);
         chat_built_idx = idx;
@@ -309,9 +346,10 @@ void chat_open(int idx) {
         chat_seen_drops = lora_drop_count();
         chat_seen_result_rev = lora_result_rev();
     } else {
-        lv_label_set_text(chat_in_time_lbl, messages[idx].time);
         scroll_bottom();
     }
+    last_link_level = -1;                           /* force the dot / poll button to refresh */
+    link_ui_update();
 
     /* text + "ID:" tag must fit the modem's payload; slot 0 sends untagged */
     int tl = (int)strlen(app_tag(idx));
@@ -336,12 +374,15 @@ void chat_poll(void) {
             if (e->seq < chat_seen_seq || e->kind != LORA_RX_MSG) continue;
             int t = e->thread;
             bool vis = chat_thread_visible(t);
-            if (vis) { make_rx_bubble(e->text, e->info); appended = true; }
-            else if (t == chat_built_idx) chat_dirty = true;     // that chat's cached bubbles are stale
+            if (vis) { make_rx_bubble(e->text, e->info); appended = true; app_unread_clear(t); }
+            else {
+                if (t == chat_built_idx) chat_dirty = true;      // that chat's cached bubbles are stale
+                app_unread_inc(t);                               // count + badge in the inbox / on Home
+            }
             snprintf(messages[t].preview, sizeof(messages[t].preview), "%s", e->text);
             app_touch_time(t);
-            messages[t].unread = !vis;                           // shows as unread in the inbox
             inbox_refresh_row(t);
+            ui_notify_rx(t, vis);                                // Class C: arrives at any time -> toast, wake screen, alert
         }
         if (appended) scroll_bottom();
         if (lora_drop_count() != chat_seen_drops) {
@@ -362,6 +403,7 @@ void chat_poll(void) {
         last_status = cur;
         if (scr_detail && lv_scr_act() == scr_detail) lora_refresh_header();
     }
+    if (scr_detail && lv_scr_act() == scr_detail) link_ui_update();
 }
 
 /* ==================== build ==================== */
@@ -394,7 +436,7 @@ void chat_build(void) {
     lv_label_set_long_mode(detail_sender_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(detail_sender_lbl, 320);
 
-    lv_obj_t* btn_poll = lv_btn_create(appbar);
+    btn_poll = lv_btn_create(appbar);
     lv_obj_set_size(btn_poll, 44, 36);
     lv_obj_align(btn_poll, LV_ALIGN_RIGHT_MID, -2, 0);
     lv_obj_set_style_bg_color(btn_poll, lv_color_hex(0xD3E3FD), LV_STATE_PRESSED);
@@ -407,6 +449,18 @@ void chat_build(void) {
     lv_label_set_text(lbl_poll, LV_SYMBOL_REFRESH);
     lv_obj_set_style_text_color(lbl_poll, lv_color_hex(0x1F1F1F), 0);
     lv_obj_center(lbl_poll);
+    if (!lora_poll_supported()) { lv_obj_add_flag(btn_poll, LV_OBJ_FLAG_HIDDEN); last_poll_supported = false; }
+
+    /* link dot: grey unknown, green listening/online, amber joining/busy, red modem problem */
+    link_dot = lv_obj_create(appbar);
+    lv_obj_set_size(link_dot, 12, 12);
+    lv_obj_align(link_dot, LV_ALIGN_RIGHT_MID, -56, 0);
+    lv_obj_set_style_radius(link_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(link_dot, 0, 0);
+    lv_obj_set_style_pad_all(link_dot, 0, 0);
+    lv_obj_set_style_bg_color(link_dot, lv_color_hex(0x9AA0A6), 0);
+    lv_obj_set_style_anim_time(link_dot, 0, 0);
+    lv_obj_clear_flag(link_dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     chat_scroll_cont = lv_obj_create(scr_detail);
     lv_obj_set_size(chat_scroll_cont, LCD_HOR_RES - 16, 226);

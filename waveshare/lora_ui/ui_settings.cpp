@@ -8,21 +8,24 @@
 #include "esp_heap_caps.h"
 
 enum {
-    R_MODEM, R_RADIO, R_TX, R_RX, R_RSSI,            /* LoRa Device: live */
-    R_FREQ, R_SF, R_BW, R_PWR, R_FW,                 /* LoRa Device: from INFO: lines ("--" until received) */
-    R_UPTIME, R_CPU, R_RAM, R_PSRAM,                 /* System */
+    R_MODEM, R_RADIO, R_CLASS, R_NET, R_REGION, R_RX2, R_DR, R_JOIN,   /* Link: status + values from INFO: lines ("--" until received) */
+    R_TX, R_RX, R_MUL, R_MDL, R_RSSI, R_LASTRX,                        /* Traffic */
+    R_EUI, R_FW, R_PROTO,                                              /* Modem */
+    R_UPTIME, R_CPU, R_RAM, R_PSRAM,                                   /* System */
     R_COUNT
 };
 
 static const char* ROW_NAMES[R_COUNT] = {
-    "Modem status", "Radio state", "Messages sent", "Messages received", "Last RSSI",
-    "Frequency", "Spreading factor", "Bandwidth", "TX power", "Modem firmware",
+    "Modem status", "Radio state", "Device class", "Network server", "Region", "Listening on (RX2)", "Uplink data rate", "Joined",
+    "Messages sent", "Messages received", "Modem uplinks", "Modem downlinks", "Last RSSI", "Last message",
+    "DevEUI", "Modem firmware", "Protocol",
     "Uptime", "CPU", "Free internal RAM", "Free PSRAM"
 };
 
 struct SettingsRow {
     lv_obj_t* lbl;
     char last[40];          /* text currently shown */
+    uint8_t tier;           /* 0 normal, 1 near the fair-use limit, 2 at the limit */
 };
 static SettingsRow rows[R_COUNT];
 static lv_timer_t* settings_timer = NULL;
@@ -32,6 +35,20 @@ static void put(int r, const char* txt) {
     if (strcmp(rows[r].last, txt) == 0) return;
     snprintf(rows[r].last, sizeof(rows[r].last), "%s", txt);
     lv_label_set_text(rows[r].lbl, txt);
+}
+
+/* "n" or "n / limit" with amber at 80 % and red at 100 %, when a fair-use limit is configured (0 = none) */
+static void put_count(int r, uint32_t n, uint32_t limit) {
+    char b[40];
+    if (limit) snprintf(b, sizeof(b), "%lu / %lu", (unsigned long)n, (unsigned long)limit);
+    else       snprintf(b, sizeof(b), "%lu", (unsigned long)n);
+    put(r, b);
+    uint8_t tier = !limit ? 0 : (n >= limit) ? 2 : (n * 5 >= limit * 4) ? 1 : 0;
+    if (tier != rows[r].tier) {
+        rows[r].tier = tier;
+        uint32_t col = (tier == 2) ? 0xB3261E : (tier == 1) ? 0xE28B00 : 0x1F1F1F;
+        lv_obj_set_style_text_color(rows[r].lbl, lv_color_hex(col), 0);
+    }
 }
 
 /* fmt contains one %s; "--" stays "--" */
@@ -48,15 +65,28 @@ void settings_refresh(void) {
     put(R_MODEM, lora_modem_status_text());
     int rs = lora_radio_state();
     put(R_RADIO, rs == 1 ? "ready" : rs == 0 ? "no radio" : "unknown");
-    snprintf(b, sizeof(b), "%lu", (unsigned long)lora_tx_count()); put(R_TX, b);
-    snprintf(b, sizeof(b), "%lu", (unsigned long)lora_rx_count()); put(R_RX, b);
-    put_fmt(R_RSSI, lora_last_rssi(), "%s dBm");
+    const char* cls = lora_info_class();
+    put(R_CLASS, !strcmp(cls, "C") ? "C (always listening)" : !strcmp(cls, "A") ? "A (polling)" : lora_class_is_c() ? "C (assumed)" : "--");
+    put(R_NET,    lora_info_net());
+    put(R_REGION, lora_info_region());
+    put(R_RX2,    lora_info_rx2());
+    put_fmt(R_DR, lora_info_dr(), "DR%s");
+    put(R_JOIN,   lora_info_join());
 
-    put_fmt(R_FREQ, lora_info_freq(), "%s MHz");
-    put_fmt(R_SF,   lora_info_sf(),   "SF%s");
-    put_fmt(R_BW,   lora_info_bw(),   "%s kHz");
-    put_fmt(R_PWR,  lora_info_pwr(),  "%s dBm");
-    put_fmt(R_FW,   lora_info_fw(),   "%s");
+    put_count(R_TX, lora_tx_count(), LORA_FAIR_USE_UL_LIMIT);        /* counts since boot */
+    put_count(R_RX, lora_rx_count(), LORA_FAIR_USE_DL_LIMIT);
+    put(R_MUL, lora_info_ul());
+    put(R_MDL, lora_info_dl());
+    put_fmt(R_RSSI, lora_last_rssi(), "%s dBm");
+    int32_t age = lora_last_rx_age_s();
+    if (age < 0)         put(R_LASTRX, "none yet");
+    else if (age < 60)   { snprintf(b, sizeof(b), "%ld s ago", (long)age); put(R_LASTRX, b); }
+    else if (age < 3600) { snprintf(b, sizeof(b), "%ld min ago", (long)(age / 60)); put(R_LASTRX, b); }
+    else                 { snprintf(b, sizeof(b), "%ld h ago", (long)(age / 3600)); put(R_LASTRX, b); }
+
+    put(R_EUI, lora_info_eui());
+    put_fmt(R_FW, lora_info_fw(), "%s");
+    snprintf(b, sizeof(b), "v%d", lora_info_proto()); put(R_PROTO, b);
 
     uint32_t s = millis() / 1000;
     snprintf(b, sizeof(b), "%lu:%02lu:%02lu", (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
@@ -69,13 +99,17 @@ void settings_refresh(void) {
 static void settings_timer_cb(lv_timer_t* t) { settings_refresh(); }
 
 void settings_open(void) {
+    lora_request_info();                                    /* the modem's answer refreshes the INFO rows within a moment */
     settings_refresh();
     if (settings_timer) lv_timer_resume(settings_timer);
 }
 
-static void on_settings_back(lv_event_t* e) {
+void settings_close(void) {
     if (settings_timer) lv_timer_pause(settings_timer);    /* no work while the screen is closed */
-    go_home();
+}
+
+static void on_settings_back(lv_event_t* e) {
+    go_home();                                              /* go_home() calls settings_close() */
 }
 
 /* ---------- build ---------- */
@@ -119,6 +153,7 @@ static void make_row(lv_obj_t* card, int r) {
     lv_label_set_text(rows[r].lbl, "--");
     lv_obj_set_style_text_color(rows[r].lbl, lv_color_hex(0x1F1F1F), 0);
     rows[r].last[0] = '\0';
+    rows[r].tier = 0;
 }
 
 void settings_build(void) {
@@ -148,8 +183,14 @@ void settings_build(void) {
     lv_obj_set_scroll_dir(body, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
 
-    lv_obj_t* card_lora = make_card(body, "LoRa Device");
-    for (int r = R_MODEM; r <= R_FW; r++) make_row(card_lora, r);
+    lv_obj_t* card_link = make_card(body, "Link");
+    for (int r = R_MODEM; r <= R_JOIN; r++) make_row(card_link, r);
+
+    lv_obj_t* card_traffic = make_card(body, "Traffic");
+    for (int r = R_TX; r <= R_LASTRX; r++) make_row(card_traffic, r);
+
+    lv_obj_t* card_modem = make_card(body, "LoRa modem");
+    for (int r = R_EUI; r <= R_PROTO; r++) make_row(card_modem, r);
 
     lv_obj_t* card_sys = make_card(body, "System");
     for (int r = R_UPTIME; r <= R_PSRAM; r++) make_row(card_sys, r);

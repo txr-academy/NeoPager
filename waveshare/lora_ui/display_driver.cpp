@@ -7,11 +7,13 @@
 #include "TCA9554.h"
 #include "TouchDrvFT6X36.hpp"
 #include "esp_heap_caps.h"
+#include "ui_power.h"
 
 static TCA9554 TCA(0x20);
 static Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, SPI_SCLK, SPI_MOSI, SPI_MISO);
 static Arduino_GFX *gfx = new Arduino_ST7796(bus, LCD_RST, LCD_ROTATION, true, 320, 480);
 static TouchDrvFT6X36 touch;
+static bool touch_ok = true;          /* false if the FT6X36 was not found: the UI still runs, only without touch */
 
 static uint32_t screenWidth;
 static uint32_t screenHeight;
@@ -38,21 +40,71 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t 
   lv_disp_flush_ready(drv);
 }
 
-/* Touch coordinate transformer with cached release points */
+/* ---------- backlight ---------- */
+#if BACKLIGHT_PWM
+  #define BL_LEDC_CH   0
+  #define BL_LEDC_FREQ 5000
+  #define BL_LEDC_BITS 8
+#endif
+
+static void backlight_init(void) {
+#ifdef GFX_BL
+  #if BACKLIGHT_PWM
+    #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+      ledcAttach(GFX_BL, BL_LEDC_FREQ, BL_LEDC_BITS);
+    #else
+      ledcSetup(BL_LEDC_CH, BL_LEDC_FREQ, BL_LEDC_BITS);
+      ledcAttachPin(GFX_BL, BL_LEDC_CH);
+    #endif
+  #else
+    pinMode(GFX_BL, OUTPUT);
+  #endif
+#endif
+}
+
+void display_set_backlight(uint8_t percent) {
+  if (percent > 100) percent = 100;
+#ifdef GFX_BL
+  #if BACKLIGHT_PWM
+    uint32_t duty = (uint32_t)percent * ((1u << BL_LEDC_BITS) - 1) / 100;
+    #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+      ledcWrite(GFX_BL, duty);
+    #else
+      ledcWrite(BL_LEDC_CH, duty);
+    #endif
+  #else
+    digitalWrite(GFX_BL, percent ? HIGH : LOW);
+  #endif
+#endif
+}
+
+/* Touch coordinate transformer with cached release points.
+   A touch that wakes a sleeping screen is swallowed until the finger lifts, so it cannot press a button by accident. */
 static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   int16_t x[1], y[1];
-  uint8_t touched = touch.getPoint(x, y, 1);
+  uint8_t touched = touch_ok ? touch.getPoint(x, y, 1) : 0;
   static int16_t last_x = 0;
   static int16_t last_y = 0;
+  static bool swallow = false;
+
+  if (touched && !swallow && power_consume_wake_touch()) swallow = true;
+  if (!touched) swallow = false;
+
+  if (touched && swallow) {
+    data->state = LV_INDEV_STATE_REL;
+    data->point.x = last_x;
+    data->point.y = last_y;
+    return;
+  }
 
   if (touched) {
     data->state = LV_INDEV_STATE_PR;
 
 #if LCD_ROTATION == 1
     data->point.x = y[0];
-    data->point.y = 319 - x[0];
+    data->point.y = (LCD_VER_RES - 1) - x[0];
 #elif LCD_ROTATION == 3
-    data->point.x = 479 - y[0];
+    data->point.x = (LCD_HOR_RES - 1) - y[0];
     data->point.y = x[0];
 #else
     data->point.x = x[0];
@@ -91,8 +143,9 @@ void display_init(void) {
   lcd_reset();
 
   if (!touch.begin(Wire, FT6X36_SLAVE_ADDRESS)) {
-    Serial.println("Failed to find FT6X36");
-    while (1) { delay(1000); }
+    /* The modem link must keep working even without touch, so do not hang here any more. */
+    Serial.println("Failed to find FT6X36 - continuing without touch");
+    touch_ok = false;
   }
 
   if (!gfx->begin(SPI_FREQ_HZ)) {
@@ -101,10 +154,8 @@ void display_init(void) {
 
   gfx->fillScreen(RGB565_BLACK);
 
-#ifdef GFX_BL
-  pinMode(GFX_BL, OUTPUT);
-  digitalWrite(GFX_BL, HIGH);
-#endif
+  backlight_init();
+  display_set_backlight(BL_LEVEL_FULL);
 
   lv_init();
 

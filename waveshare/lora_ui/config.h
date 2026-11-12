@@ -31,8 +31,18 @@
 #define MODEM_TX_PIN     43          /* board transmits -> Heltec GPIO5 */
 #define MODEM_BAUD       115200
 #define LORA_HIST_MAX    (NUM_MESSAGES * LORA_PER_THREAD)   /* derived: last LORA_PER_THREAD messages of every chat */
-#define LORA_TX_TIMEOUT  8000        /* ms to wait for STATUS:SENT/FAIL */
-#define MODEM_SILENT_MS  15000
+#define MODEM_SILENT_MS  15000       /* no line from the modem for this long = "modem silent" (Heltec heartbeat is every 3 s) */
+
+/* ---------- Class C link (Heltec firmware v2, protocol 2) ---------- */
+#define LORA_PROTO_DEFAULT   2       /* 2 = send "TX2:<id>:..." (message ids, needs Heltec v2). 1 = legacy "TX:..." */
+#define LORA_ASSUME_CLASS_C  1       /* until the modem's INFO says otherwise. 0 = show the poll button until INFO:CLASS=C arrives */
+#define LORA_QUEUE_TIMEOUT   4000    /* ms to wait for STATUS:QUEUED (or FAIL) after sending, else the message fails */
+#define LORA_TX_TIMEOUT      20000   /* ms a QUEUED message may wait for STATUS:SENT (4 queued x ~2.5 s + margin) */
+#define LORA_EXPECT_ACKS     1       /* 1 = the relay sends delivery receipts (downlink "#A:<crc8 hex>", turned into STATUS:ACK:<id> by the modem): bubbles can show "Delivered". 0 = ends at "Sent via LoRa" */
+/* Optional fair-use meters on the Settings screen (counts since boot). 0 = off.
+   TTN community network: 10 downlinks/day. Your own gateway server (built-in / ChirpStack): leave 0. */
+#define LORA_FAIR_USE_UL_LIMIT  0
+#define LORA_FAIR_USE_DL_LIMIT  0
 /* 1 = echo every sent/received message to the USB serial monitor. Set 0 for privacy. */
 #define LORA_SERIAL_LOG  1
 
@@ -65,3 +75,17 @@
 #else
   #define FONT_L LV_FONT_DEFAULT
 #endif
+
+/* ---------- Screen power / lock (the Heltec stays awake for Class C; the display does not have to) ---------- */
+#define BACKLIGHT_PWM        1       /* 1 = dim with PWM. 0 = plain on/off (use this if ledc* fails to compile on your core) */
+#define BL_LEVEL_FULL        100     /* % */
+#define BL_LEVEL_DIM         15      /* % */
+#define SCREEN_DIM_MS        30000   /* idle time until dim, 0 = never */
+#define SCREEN_OFF_MS        60000   /* idle time until the screen turns off, 0 = never */
+#define RELOCK_ON_SCREEN_OFF 1       /* 1 = turning the screen off also returns to Home, so Messages needs the PIN again */
+
+/* ---------- New-message notification ---------- */
+#define NOTIFY_SHOW_SENDER   0       /* 0 = toast says only "New message" (nothing private on a locked screen). 1 = include the contact name */
+#define NOTIFY_MS            4000    /* how long the toast stays */
+#define ALERT_GPIO           -1      /* optional buzzer / LED pin, pulsed on every received message. -1 = none */
+#define ALERT_PULSE_MS       150

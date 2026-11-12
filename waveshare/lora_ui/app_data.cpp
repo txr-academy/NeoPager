@@ -11,6 +11,8 @@ struct ContactStore { uint8_t version; ContactRec rec[MAX_CONTACTS]; };   /* slo
 static ContactRec contacts[NUM_MESSAGES];
 static char time_buf[NUM_MESSAGES][16];
 static char body_buf[NUM_MESSAGES][112];
+static uint8_t  unread_n[NUM_MESSAGES];
+static uint32_t last_act[NUM_MESSAGES];
 MessageItem messages[NUM_MESSAGES];
 int current_msg_idx = 0;
 
@@ -31,6 +33,8 @@ static void init_message(int i) {
     snprintf(time_buf[i], sizeof(time_buf[i]), "--");
     m.time = time_buf[i];
     m.unread = false;
+    unread_n[i] = 0;
+    last_act[i] = 0;
     m.avatar_color = contacts[i].color;
     m.reply[0] = '\0';
     m.has_reply = false;
@@ -69,7 +73,26 @@ void app_touch_time(int idx) {
     uint32_t sec = millis() / 1000;
     snprintf(time_buf[idx], sizeof(time_buf[idx]), "T+%02lu:%02lu",
              (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+    last_act[idx] = millis() + 1;                       /* never 0 */
 }
+
+void app_unread_inc(int idx) {
+    if (idx < 0 || idx >= NUM_MESSAGES) return;
+    if (unread_n[idx] < 99) unread_n[idx]++;
+    messages[idx].unread = true;
+}
+void app_unread_clear(int idx) {
+    if (idx < 0 || idx >= NUM_MESSAGES) return;
+    unread_n[idx] = 0;
+    messages[idx].unread = false;
+}
+int app_unread_count(int idx) { return (idx >= 0 && idx < NUM_MESSAGES) ? unread_n[idx] : 0; }
+int app_unread_total(void) {
+    int t = 0;
+    for (int i = 0; i < NUM_MESSAGES; i++) t += unread_n[i];
+    return t;
+}
+uint32_t app_last_activity(int idx) { return (idx >= 0 && idx < NUM_MESSAGES) ? last_act[idx] : 0; }
 
 const char* app_tag(int idx) { return contacts[idx].tag; }
 bool contact_used(int slot)  { return slot >= 0 && slot < NUM_MESSAGES && contacts[slot].used; }

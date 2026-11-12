@@ -14,3 +14,10 @@ bool contact_used(int slot);
 /* Adds a contact. Returns its slot, or -1 with *err set to a short reason for the UI. */
 int  contact_add(const char* name, const char* id, const char** err);
 void contact_remove(int slot);                         /* frees the slot and saves; slot 0 cannot be removed */
+
+/* Unread tracking and recency (used by the inbox order, the unread badges and the Home screen) */
+void     app_unread_inc(int idx);              /* a message arrived while that chat was not on screen */
+void     app_unread_clear(int idx);
+int      app_unread_count(int idx);
+int      app_unread_total(void);               /* sum over all chats */
+uint32_t app_last_activity(int idx);           /* millis()+1 of the last send/receive, 0 = none since boot */

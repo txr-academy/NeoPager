@@ -14,6 +14,9 @@ static lv_obj_t* row_name_labels[NUM_MESSAGES];
 static lv_obj_t* row_snip_labels[NUM_MESSAGES];
 static lv_obj_t* row_time_labels[NUM_MESSAGES];
 static int8_t    row_style_unread[NUM_MESSAGES];   /* last applied unread state (-1 = none yet) */
+static lv_obj_t* row_badge[NUM_MESSAGES];          /* unread count bubble at the right of the row */
+static lv_obj_t* row_badge_lbl[NUM_MESSAGES];
+static int16_t   row_badge_n[NUM_MESSAGES];        /* last count shown (-1 = none yet) */
 
 /* Touch drag discrimination */
 static lv_point_t row_press_pos;
@@ -40,11 +43,27 @@ static void update_row_read_styling(int idx) {
     }
 }
 
+static void update_badge(int idx) {
+    if (!row_badge[idx]) return;
+    int n = app_unread_count(idx);
+    if (row_badge_n[idx] == n) return;
+    row_badge_n[idx] = (int16_t)n;
+    if (n == 0) { lv_obj_add_flag(row_badge[idx], LV_OBJ_FLAG_HIDDEN); return; }
+    char b[6];
+    if (n > 9) snprintf(b, sizeof(b), "9+"); else snprintf(b, sizeof(b), "%d", n);
+    lv_label_set_text(row_badge_lbl[idx], b);
+    lv_obj_center(row_badge_lbl[idx]);
+    lv_obj_clear_flag(row_badge[idx], LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Called whenever a chat has new activity (message sent or received): update the row and bring it to the top */
 void inbox_refresh_row(int idx) {
     if (idx < 0 || idx >= NUM_MESSAGES || !row_snip_labels[idx]) return;
     lv_label_set_text(row_snip_labels[idx], messages[idx].preview);
     lv_label_set_text(row_time_labels[idx], messages[idx].time);
     update_row_read_styling(idx);
+    update_badge(idx);
+    if (list_rows[idx]) lv_obj_move_background(list_rows[idx]);      /* first child = top of the list */
 }
 
 /* ---------- delete a contact (long press on its row) ---------- */
@@ -101,7 +120,8 @@ static void on_message_row_touch(lv_event_t* e) {
         if (indev && lv_indev_get_scroll_obj(indev) != NULL) return;
 
         if (idx >= 0 && idx < NUM_MESSAGES && contact_used((int)idx)) {
-            messages[idx].unread = false;
+            app_unread_clear((int)idx);
+            update_badge((int)idx);
             update_row_read_styling((int)idx);
             go_chat((int)idx);
         }
@@ -124,9 +144,24 @@ void inbox_rebuild(void) {
     memset(row_snip_labels, 0, sizeof(row_snip_labels));
     memset(row_time_labels, 0, sizeof(row_time_labels));
     memset(row_style_unread, -1, sizeof(row_style_unread));
+    memset(row_badge, 0, sizeof(row_badge));
+    memset(row_badge_lbl, 0, sizeof(row_badge_lbl));
+    for (int i = 0; i < NUM_MESSAGES; i++) row_badge_n[i] = -1;
 
-    for (int i = 0; i < NUM_MESSAGES; i++) {
-        if (!contact_used(i)) continue;
+    /* most recent activity first; chats without activity keep slot order (stable insertion sort) */
+    int order[NUM_MESSAGES];
+    int cnt = 0;
+    for (int i = 0; i < NUM_MESSAGES; i++) if (contact_used(i)) order[cnt++] = i;
+    for (int a = 1; a < cnt; a++) {
+        int v = order[a];
+        uint32_t va = app_last_activity(v);
+        int b = a - 1;
+        while (b >= 0 && app_last_activity(order[b]) < va) { order[b + 1] = order[b]; b--; }
+        order[b + 1] = v;
+    }
+
+    for (int k = 0; k < cnt; k++) {
+        int i = order[k];
 
         list_rows[i] = lv_obj_create(list);
         lv_obj_set_size(list_rows[i], LCD_HOR_RES - 16, 68);
@@ -177,11 +212,27 @@ void inbox_rebuild(void) {
         row_snip_labels[i] = lv_label_create(list_rows[i]);
         lv_label_set_text(row_snip_labels[i], messages[i].preview);
         lv_obj_set_pos(row_snip_labels[i], 62, 38);
-        lv_obj_set_width(row_snip_labels[i], (LCD_HOR_RES - 16) - 74);
+        lv_obj_set_width(row_snip_labels[i], (LCD_HOR_RES - 16) - 74 - 36);     /* leaves room for the badge */
         lv_label_set_long_mode(row_snip_labels[i], LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(row_snip_labels[i], LV_OBJ_FLAG_CLICKABLE);
 
+        row_badge[i] = lv_obj_create(list_rows[i]);
+        lv_obj_set_size(row_badge[i], 24, 24);
+        lv_obj_set_pos(row_badge[i], (LCD_HOR_RES - 16) - 40, 36);
+        lv_obj_set_style_radius(row_badge[i], LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(row_badge[i], lv_color_hex(0x0B57D0), 0);
+        lv_obj_set_style_border_width(row_badge[i], 0, 0);
+        lv_obj_set_style_pad_all(row_badge[i], 0, 0);
+        lv_obj_set_style_anim_time(row_badge[i], 0, 0);
+        lv_obj_clear_flag(row_badge[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row_badge[i], LV_OBJ_FLAG_HIDDEN);
+        row_badge_lbl[i] = lv_label_create(row_badge[i]);
+        lv_obj_set_style_text_color(row_badge_lbl[i], lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(row_badge_lbl[i], "");
+        lv_obj_center(row_badge_lbl[i]);
+
         update_row_read_styling(i);
+        update_badge(i);
     }
 }
 

@@ -13,7 +13,7 @@ lv_obj_t* scr_addcontact = NULL;
 
 /* Messages relock implicitly: the inbox is only reachable through go_pin(),
    and every route back to Home leaves it. Inbox <-> chat never asks again. */
-void go_home(void)     { lv_scr_load(scr_home); }
+void go_home(void)     { settings_close(); lv_scr_load(scr_home); }   /* also called when the screen turns off */
 void go_settings(void) { settings_open(); lv_scr_load(scr_settings); }
 void go_pin(void)      { pin_reset(); lv_scr_load(scr_pin); }
 void go_inbox(void)    { lv_scr_load(scr_inbox); }
